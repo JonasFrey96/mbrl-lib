@@ -747,3 +747,343 @@ def create_trajectory_optim_agent_for_model(
 
     agent.set_trajectory_eval_fn(trajectory_eval_fn)
     return agent
+
+
+
+
+
+class BatchedCEMOptimizer(Optimizer):
+    """Implements the Cross-Entropy Method optimization algorithm.
+
+    A good description of CEM [1] can be found at https://arxiv.org/pdf/2008.06389.pdf. This
+    code implements the version described in Section 2.1, labeled CEM_PETS
+    (but note that the shift-initialization between planning time steps is handled outside of
+    this class by TrajectoryOptimizer).
+
+    This implementation also returns the best solution found as opposed
+    to the mean of the last generation.
+
+    Args:
+        num_iterations (int): the number of iterations (generations) to perform.
+        elite_ratio (float): the proportion of the population that will be kept as
+            elite (rounds up).
+        population_size (int): the size of the population.
+        lower_bound (sequence of floats): the lower bound for the optimization variables.
+        upper_bound (sequence of floats): the upper bound for the optimization variables.
+        alpha (float): momentum term.
+        device (torch.device): device where computations will be performed.
+        return_mean_elites (bool): if ``True`` returns the mean of the elites of the last
+            iteration. Otherwise, it returns the max solution found over all iterations.
+        clipped_normal (bool); if ``True`` samples are drawn from a normal distribution
+            and clipped to the bounds. If ``False``, sampling uses a truncated normal
+            distribution up to the bounds. Defaults to ``False``.
+
+    [1] R. Rubinstein and W. Davidson. "The cross-entropy method for combinatorial and continuous
+    optimization". Methodology and Computing in Applied Probability, 1999.
+    """
+
+    def __init__(
+        self,
+        num_iterations: int,
+        elite_ratio: float,
+        population_size: int,
+        lower_bound: Sequence[Sequence[float]],
+        upper_bound: Sequence[Sequence[float]],
+        alpha: float,
+        device: torch.device,
+        return_mean_elites: bool = False,
+        clipped_normal: bool = False,
+        **kwargs,
+    ):
+        super().__init__()
+        self.num_iterations = num_iterations
+        self.elite_ratio = elite_ratio
+        self.population_size = population_size
+        self.elite_num = np.ceil(self.population_size * self.elite_ratio).astype(
+            np.int32
+        )
+        self.lower_bound = torch.tensor(lower_bound, device=device, dtype=torch.float32)
+        self.upper_bound = torch.tensor(upper_bound, device=device, dtype=torch.float32)
+        self.alpha = alpha
+        self.return_mean_elites = return_mean_elites
+        self.device = device
+
+        self._clipped_normal = clipped_normal
+
+    def _init_population_params(
+        self, x0: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean = x0.clone()
+        if self._clipped_normal:
+            dispersion = torch.ones_like(mean)
+        else:
+            dispersion = ((self.upper_bound - self.lower_bound) ** 2) / 16
+        return mean, dispersion
+
+    def _sample_population(
+        self, mean: torch.Tensor, dispersion: torch.Tensor, population: torch.Tensor
+    ) -> torch.Tensor:
+        # fills population with random samples
+        # for truncated normal, dispersion should be the variance
+        # for clipped normal, dispersion should be the standard deviation
+        if self._clipped_normal:
+            pop = mean + dispersion * torch.randn_like(population)
+            pop = torch.where(pop > self.lower_bound, pop, self.lower_bound)
+            population = torch.where(pop < self.upper_bound, pop, self.upper_bound)
+            return population
+        else:
+            lb_dist = mean - self.lower_bound
+            ub_dist = self.upper_bound - mean
+            mv = torch.min(torch.square(lb_dist / 2), torch.square(ub_dist / 2))
+            constrained_var = torch.min(mv, dispersion)
+
+            population = mbrl.util.math.truncated_normal_(population)
+            return population * torch.sqrt(constrained_var) + mean
+
+    def _update_population_params(
+        self, elite: torch.Tensor, mu: torch.Tensor, dispersion: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        new_mu = torch.mean(elite, dim=0)
+        if self._clipped_normal:
+            raise ValueError("Not correctly checked for batch implementation")
+            new_dispersion = torch.std(elite, dim=0)
+        else:
+            new_dispersion = torch.var(elite, dim=0)
+        mu = self.alpha * mu + (1 - self.alpha) * new_mu
+        dispersion = self.alpha * dispersion + (1 - self.alpha) * new_dispersion
+        return mu, dispersion
+
+    def optimize(
+        self,
+        obj_fun: Callable[[torch.Tensor], torch.Tensor],
+        x0: Optional[torch.Tensor] = None,
+        callback: Optional[Callable[[torch.Tensor, torch.Tensor, int], None]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Runs the optimization using CEM.
+
+        Args:
+            obj_fun (callable(tensor) -> tensor): objective function to maximize.
+            x0 (tensor, optional): initial mean for the population. Must
+                be consistent with lower/upper bounds.
+            callback (callable(tensor, tensor, int) -> any, optional): if given, this
+                function will be called after every iteration, passing it as input the full
+                population tensor, its corresponding objective function values, and
+                the index of the current iteration. This can be used for logging and plotting
+                purposes.
+
+        Returns:
+            (torch.Tensor): the best solution found.
+        """
+        BS = x0.shape[0]
+        mu, dispersion = self._init_population_params(x0) # should be fine
+        best_solution = torch.empty_like( mu )
+        best_value = best_value = torch.full( (BS,),-torch.inf, device=self.device)
+        
+        population = torch.zeros((self.population_size,) + x0.shape).to(
+            device=self.device
+        )
+        for i in range(self.num_iterations):
+            population = self._sample_population(mu, dispersion, population)
+            values = obj_fun(population)
+
+            if callback is not None:
+                callback(population, values, i)
+
+            # filter out NaN values
+            values[values.isnan()] = -1e-10
+            best_values, elite_idx = values.topk(self.elite_num,dim=0)
+
+            batch_topk_idx = torch.arange(0,BS, device=self.device, dtype=torch.long)[None, :].repeat(self.elite_num, 1).reshape(-1)
+            elite = population[elite_idx.reshape(-1), batch_topk_idx]
+            
+            elite = elite.reshape( self.elite_num, BS, elite.shape[1], elite.shape[2])
+            mu, dispersion = self._update_population_params(elite, mu, dispersion)
+
+            m = best_values[0] > best_value
+            if m.sum() > 0:
+                best_value[m] = best_values[0,m]
+                best_solution[m] = population[elite_idx[0,m], torch.where(m)[0]].clone()
+
+        return mu if self.return_mean_elites else best_solution
+    
+    
+    
+
+class BatchedICEMOptimizer(Optimizer):
+    """Implements the Improved Cross-Entropy Method (iCEM) optimization algorithm.
+
+    iCEM improves the sample efficiency over standard CEM and was introduced by
+    [2] for real-time planning.
+
+    Args:
+        num_iterations (int): the number of iterations (generations) to perform.
+        elite_ratio (float): the proportion of the population that will be kept as
+            elite (rounds up).
+        population_size (int): the size of the population.
+        population_decay_factor (float): fixed factor for exponential decrease in population size
+        colored_noise_exponent (float): colored-noise scaling exponent for generating correlated
+            action sequences.
+        lower_bound (sequence of floats): the lower bound for the optimization variables.
+        upper_bound (sequence of floats): the upper bound for the optimization variables.
+        keep_elite_frac (float): the fraction of elites to keep (or shift) during CEM iterations
+        alpha (float): momentum term.
+        device (torch.device): device where computations will be performed.
+        return_mean_elites (bool): if ``True`` returns the mean of the elites of the last
+            iteration. Otherwise, it returns the max solution found over all iterations.
+        population_size_module (int, optional): if specified, the population is rounded to be
+            a multiple of this number. Defaults to ``None``.
+
+    [2] C. Pinneri, S. Sawant, S. Blaes, J. Achterhold, J. Stueckler, M. Rolinek and
+    G, Martius, Georg. "Sample-efficient Cross-Entropy Method for Real-time Planning".
+    Conference on Robot Learning, 2020.
+    """
+
+    def __init__(
+        self,
+        num_iterations: int,
+        elite_ratio: float,
+        population_size: int,
+        population_decay_factor: float,
+        colored_noise_exponent: float,
+        lower_bound: Sequence[Sequence[float]],
+        upper_bound: Sequence[Sequence[float]],
+        keep_elite_frac: float,
+        alpha: float,
+        device: torch.device,
+        return_mean_elites: bool = False,
+        population_size_module: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.num_iterations = num_iterations
+        self.elite_ratio = elite_ratio
+        self.population_size = population_size
+        self.population_decay_factor = population_decay_factor
+        self.elite_num = np.ceil(self.population_size * self.elite_ratio).astype(
+            np.int32
+        )
+        self.colored_noise_exponent = colored_noise_exponent
+        self.lower_bound = torch.tensor(lower_bound, device=device, dtype=torch.float32)
+        self.upper_bound = torch.tensor(upper_bound, device=device, dtype=torch.float32)
+        self.initial_var = ((self.upper_bound - self.lower_bound) ** 2) / 16
+        self.keep_elite_frac = keep_elite_frac
+        self.keep_elite_size = np.ceil(keep_elite_frac * self.elite_num).astype(
+            np.int32
+        )
+        self.elite = None
+        self.alpha = alpha
+        self.return_mean_elites = return_mean_elites
+        self.population_size_module = population_size_module
+        self.device = device
+
+        if self.population_size_module:
+            self.keep_elite_size = self._round_up_to_module(
+                self.keep_elite_size, self.population_size_module
+            )
+
+    @staticmethod
+    def _round_up_to_module(value: int, module: int) -> int:
+        if value % module == 0:
+            return value
+        return value + (module - value % module)
+
+    def optimize(
+        self,
+        obj_fun: Callable[[torch.Tensor], torch.Tensor],
+        x0: Optional[torch.Tensor] = None,
+        callback: Optional[Callable[[torch.Tensor, torch.Tensor, int], None]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Runs the optimization using iCEM.
+
+        Args:
+            obj_fun (callable(tensor) -> tensor): objective function to maximize.
+            x0 (tensor, optional): initial mean for the population. Must
+                be consistent with lower/upper bounds.
+            callback (callable(tensor, tensor, int) -> any, optional): if given, this
+                function will be called after every iteration, passing it as input the full
+                population tensor, its corresponding objective function values, and
+                the index of the current iteration. This can be used for logging and plotting
+                purposes.
+        Returns:
+            (torch.Tensor): the best solution found.
+        """
+        mu = x0.clone()
+        var = self.initial_var.clone()
+        BS = x0.shape[0]
+        best_solution = torch.empty_like( mu )
+        best_value = best_value = torch.full( (BS,),-torch.inf, device=self.device)
+
+        for i in range(self.num_iterations):
+            decay_population_size = np.ceil(
+                np.max(
+                    (
+                        self.population_size * self.population_decay_factor**-i,
+                        2 * self.elite_num,
+                    )
+                )
+            ).astype(np.int32)
+
+            if self.population_size_module:
+                decay_population_size = self._round_up_to_module(
+                    decay_population_size, self.population_size_module
+                )
+            # the last dimension is used for temporal correlations
+            population = mbrl.util.math.powerlaw_psd_gaussian(
+                self.colored_noise_exponent,
+                size=(decay_population_size, x0.shape[0], x0.shape[2], x0.shape[1]),
+                device=self.device,
+            ).permute(0,1,3,2)
+            population = torch.minimum(
+                population * torch.sqrt(var) + mu, self.upper_bound
+            )
+            population = torch.maximum(population, self.lower_bound)
+            if self.elite is not None:
+                kept_elites = torch.index_select(
+                    self.elite,
+                    dim=0,
+                    index=torch.randperm(self.elite_num, device=self.device)[
+                        : self.keep_elite_size
+                    ],
+                )
+                if i == 0:
+                    end_action = (
+                        torch.normal(
+                            mu[-1, :].repeat(kept_elites.shape[0], 1),
+                            torch.sqrt(var[-1, :]).repeat(kept_elites.shape[0], 1),
+                        )
+                        .unsqueeze(1)
+                        .to(self.device)
+                    )
+                    kept_elites_shifted = torch.cat(
+                        (kept_elites[:, 1:, :], end_action), dim=1
+                    )
+                    population = torch.cat((population, kept_elites_shifted), dim=0)
+                elif i == self.num_iterations - 1:
+                    population = torch.cat((population, mu.unsqueeze(dim=0)), dim=0)
+                else:
+                    population = torch.cat((population, kept_elites), dim=0)
+
+            values = obj_fun(population)
+            # filter out NaN values
+            values[values.isnan()] = -1e-10
+            best_values, elite_idx = values.topk(self.elite_num, dim=0)
+            
+            batch_topk_idx = torch.arange(0,BS, device=self.device, dtype=torch.long)[None, :].repeat(self.elite_num, 1).reshape(-1)
+            self.elite = population[elite_idx.reshape(-1), batch_topk_idx]
+            
+            self.elite = self.elite.reshape( self.elite_num, BS, self.elite.shape[1], self.elite.shape[2])
+            
+            new_mu = torch.mean(self.elite, dim=0)
+            new_var = torch.var(self.elite, unbiased=False, dim=0)
+            mu = self.alpha * mu + (1 - self.alpha) * new_mu
+            var = self.alpha * var + (1 - self.alpha) * new_var
+
+            m = best_values[0] > best_value
+            if m.sum() > 0:
+                best_value[m] = best_values[0,m]
+                best_solution[m] = population[elite_idx[0,m], torch.where(m)[0]].clone()
+
+        return mu if self.return_mean_elites else best_solution
+
