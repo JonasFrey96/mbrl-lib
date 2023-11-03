@@ -1048,18 +1048,18 @@ class BatchedICEMOptimizer(Optimizer):
                     ],
                 )
                 if i == 0:
+                    
                     end_action = (
                         torch.normal(
-                            mu[-1, :].repeat(kept_elites.shape[0], 1),
-                            torch.sqrt(var[-1, :]).repeat(kept_elites.shape[0], 1),
+                            mu[:,-1, :].repeat(kept_elites.shape[0], 1,1),
+                            torch.sqrt(var[None,None]).repeat(kept_elites.shape[0],BS, 1),
                         )
-                        .unsqueeze(1)
+                        .unsqueeze(2)
                         .to(self.device)
                     )
-                    kept_elites_shifted = torch.cat(
-                        (kept_elites[:, 1:, :], end_action), dim=1
-                    )
+                    kept_elites_shifted = torch.cat((kept_elites[:, :, 1:, :], end_action), dim=2)
                     population = torch.cat((population, kept_elites_shifted), dim=0)
+                    
                 elif i == self.num_iterations - 1:
                     population = torch.cat((population, mu.unsqueeze(dim=0)), dim=0)
                 else:
